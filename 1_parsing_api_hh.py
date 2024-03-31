@@ -1,8 +1,12 @@
 import requests                 # Для работы с http-запросами
 import fake_useragent           # Для создания заголовков
-import os                       # Для работы с ОС (для создания файлов)
 import json                     # Для работы с форматом json
 import time                     # Для задержки между запросами
+import pandas as pd             # Для удобной загрузки данных в БД
+import sqlalchemy               # Для подключения к СУБД
+from pycbrf.toolbox import ExchangeRates    # Для курса валют
+import datetime
+
 
 # Функция для создания рандомных заголовков
 def get_headers():
@@ -23,64 +27,152 @@ def get_page(text, pg=0):
     # Чтобы спарсить вакансии со страницы, нужно выполнить методом GET http-запрос,
     # включая параметры фильтра поиска (ответ приходит в формате json):
     url = 'https://api.hh.ru/vacancies'
-    req = requests.get(url, params, headers=get_headers())  # Запрос к API
-    data = req.content.decode()                             # Декодирование ответа (для Кириллицы)
-    req.close()
+    req = requests.get(url, params, headers=get_headers(), timeout=20)  # Запрос к API
+    data = req.content.decode()                 # Декодирование ответа (для Кириллицы)
     return data
 
 
 # Текст поискового запроса
 text_filter = '"Data Engineer" OR "ML Engineer" OR "ETL Developer"'
 
-# Считывание 1000 вакансий (10 страниц по 100 вакансий)
-for page in range(0, 10):
+page_result_list = []
+# Считывание 10000 вакансий (100 страниц по 100 вакансий)
+for page in range(0, 100):
     # Преобразование текстового ответа запроса в словарь
     page_dict = json.loads(get_page(text_filter, page))
 
-    # Сохранение файлов страниц в папку {путь до текущего файла}/docs/pagination
-    # Формирование имени документа (количество файлов в папке - len(...))
-    file_name = './docs/pagination/{}.json'.format(len(os.listdir('./docs/pagination')))
+    # Сохранение страниц в список
+    page_result_list.append(json.dumps(page_dict, ensure_ascii=False))
 
-    # Создание нового документа, запись ответа запроса, закрытие документа
-    f = open(file_name, mode='w', encoding='utf8')
-    f.write(json.dumps(page_dict, ensure_ascii=False))
-    f.close()
-
-    # Условие выхода из цикла (если страниц окажется меньше 10)
+    # Условие выхода из цикла (если страниц окажется меньше 100)
     if (page_dict['pages'] - page) <= 1:
         break
     # Задержка, чтобы не нагружать сервисы hh
     time.sleep(0.25)
 print('Страницы поиска собраны')
 
-# Перебор файлов страниц, в которых указаны списки вакансий на одной странице
-i = 0               # Счетчик для вывода информации о количестве вакансий
-for fl in os.listdir('./docs/pagination'):
-    # Открытие, чтение, закрытие файла
-    f = open(f'./docs/pagination/{fl}', encoding='utf8')
-    json_text = f.read()
-    f.close()
-    # Перевод текста файла в словарь
-    json_dict = json.loads(json_text)
+# Перебор списка страниц, в которых указаны списки вакансий на одной странице
+vacancies_result_list = []
+vac_cnt = json.loads(page_result_list[0])['found']  # Общее количество вакансий
+cnt = 0  # Счетчик для вывода информации о количестве вакансий
+for fl in page_result_list:
+    # Перевод текста страницы в словарь
+    json_dict = json.loads(fl)
 
-    vac_count = json_dict['found']      # Общее количество вакансий
     # Перебор списка вакансий, указанных на одной странице
     for vac in json_dict['items']:
         # Обращение к API и получение детальной информации по каждой конкретной вакансии (на основе её url)
         req = requests.get(vac['url'], headers=get_headers())
         data = req.content.decode()
-        req.close()
 
-        # Сохранение файлов вакансий в папку {путь до текущего файла}/docs/vacancies
-        # id вакансии в качестве названия
-        file_name = f"./docs/vacancies/{vac['id']}.json"
-
-        # Создание нового документа, запись ответа запроса, закрытие документа
-        f = open(file_name, mode='w', encoding='utf8')
-        f.write(data)
-        f.close()
+        # Сохранение вакансии в список
+        vacancies_result_list.append(data)
 
         time.sleep(0.25)
-        i += 1
-        print(f'Обработано {i} из {vac_count} вакансий')
+        cnt += 1
+        print(f'Обработано {cnt} из {vac_cnt} вакансий')
 print('Вакансии собраны')
+
+
+###########################################################################
+
+# Для случаев, когда обращение по ключу возвращает None, и нужно законтрить следующий get
+def if_dict_returns_none(key):
+    if json_dict.get(key) is None:
+        return dict()
+    else:
+        return json_dict.get(key, dict())
+
+
+# Для случаев, когда обращение по ключу возвращает None, и нужно оформить цикл по пустому списку вместо None
+def if_dict_returns_none_lst(key):
+    if json_dict.get(key) is None:
+        return []
+    else:
+        return json_dict.get(key, [])
+
+
+# Создание списков словарей для таблиц vacancy, company, skill
+vacancy, company, skill = [], [], []
+
+# Перебор всех вакансий в списке vacancies_result_list
+for fl in vacancies_result_list:
+    # Перевод текста в словарь
+    json_dict = json.loads(fl)
+
+    # Заполнение словарей для таблиц
+    vacancy_fl = {'id': json_dict.get('id'),
+                  'name': json_dict.get('name'),
+                  'experience': if_dict_returns_none('experience').get('name'),
+                  'description': json_dict.get('description'),
+                  'salary_from': if_dict_returns_none('salary').get('from'),
+                  'salary_to': if_dict_returns_none('salary').get('to'),
+                  'salary_currency': if_dict_returns_none('salary').get('currency'),
+                  'company_id': if_dict_returns_none('employer').get('id')}
+    vacancy.append(vacancy_fl)
+
+    company_fl = {'id': if_dict_returns_none('employer').get('id'),
+                  'name': if_dict_returns_none('employer').get('name')}
+    company.append(company_fl)
+
+    # Пример хранения скиллов: json_dict['key_skills'] = [{"name":"Python"},{"name":"Bash"},{"name":"Docker"}...]
+    for skl in if_dict_returns_none_lst('key_skills'):
+        skill_fl = {'vacancy_id': json_dict.get('id'),
+                    'name': skl.get('name')}
+        skill.append(skill_fl)
+print('Вакансии обработаны')
+
+# Результаты заносим в дата-фреймы
+vac = pd.DataFrame(vacancy)
+comp = pd.DataFrame(company).drop_duplicates()
+skll = pd.DataFrame(skill)
+
+# Находим среднюю зарплату между "от" и "до"
+vac['sal_avg'] = (vac['salary_to'].fillna(vac['salary_from']) + vac['salary_from'].fillna(vac['salary_to'])) / 2
+
+# Получаем курсы валют
+current_date = datetime.date.today().isoformat()
+rates = ExchangeRates(current_date) # задаем дату, за которую хотим получить данные валют
+usd = int(rates['USD'].value)
+eur = int(rates['EUR'].value)
+
+
+# Функция для конвертации средней зарплаты в рубли
+def convert_currency(row):
+    if row['salary_currency'] == 'RUR':
+        res = row['sal_avg']
+    elif row['salary_currency'] == 'EUR':
+        res = row['sal_avg'] * eur
+    elif row['salary_currency'] == 'USD':
+        res = row['sal_avg'] * usd
+    else:
+        res = None
+    return res
+
+
+vac['sal2rub'] = vac.apply(convert_currency, axis=1)
+vac_fin = vac[['vacancy_id', 'vacancy_name', 'experience', 'description', 'company_id', 'sal2rub']]
+vac_comp = vac_fin.merge(comp, how='left', on='company_id')
+
+###########################################################################
+
+# Данные для подключения к БД
+user = '**********'
+password = '**********'
+host = 'localhost'
+port = 5432
+database = 'parsing_hh'
+
+# Создание подключения к БД
+eng = sqlalchemy.engine.create_engine(f'postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}')
+conn = eng.connect()
+print('Подключение к БД создано')
+
+# Создание дата-фреймов pandas и таблиц в БД
+vac_comp.to_sql('vacancy', eng, if_exists='replace', index=False)
+skll.to_sql('skill', eng, if_exists='replace', index=False)
+print('Данные загружены в БД')
+
+# Закрытие соединения с БД
+conn.close()
+print('Соединение с БД закрыто')
